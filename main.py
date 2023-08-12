@@ -1,11 +1,16 @@
 import http.server
-import threading
-import urllib.request
 import os
+import threading
+import urllib.parse
+import urllib.request
 import json
 import queue
 import time
 from functools import reduce
+
+# Глобальные очереди для хранения задач сортировки и результатов
+sorting_queue = queue.Queue()
+result_queue = queue.Queue()
 
 # Глобальный словарь для хранения состояний и данных сортировки
 sorting_data = {}
@@ -43,11 +48,49 @@ def merge_sort(numbers):
     return reduce(merge, [left_half, right_half])
 
 
+# Функция для обработки запроса на сортировку
+def process_sort_request(url, concurrency, job_id):
+    try:
+        urllib.request.urlretrieve(url, f"{job_id}.data")
+    except Exception as e:
+        with sorting_data_lock:
+            sorting_data[job_id] = {
+                "state": "error",
+                "data": []
+            }
+        return
+
+    with open(f"{job_id}.data", "r") as f:
+        numbers = [int(num) for num in f.read().strip().split()]
+
+    chunk_size = len(numbers) // concurrency
+    chunks = [numbers[i:i + chunk_size] for i in range(0, len(numbers), chunk_size)]
+
+    for chunk in chunks:
+        sorting_queue.put((chunk, job_id))
+
+
+# Функция worker для сортировки кусков данных
+def worker():
+    while True:
+        chunk, job_id = sorting_queue.get()
+        result = merge_sort(chunk)
+
+        with sorting_data_lock:
+            sorting_data[job_id] = {
+                "state": "ready",
+                "data": result
+            }
+
+        result_queue.put((result, job_id))
+        sorting_queue.task_done()
+        # Удаление временного файла после завершения сортировки
+        os.remove(f"{job_id}.data")
+
 # Класс HTTP-обработчика для сервера
 class SortingServerHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/?sort="):
-            # Обработка запроса на сортировку
             query_params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             url = query_params.get("sort", [None])[0]
             concurrency = int(query_params.get("concurrency", [1])[0])
@@ -58,14 +101,10 @@ class SortingServerHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"Invalid parameters")
                 return
 
-            # Генерируем уникальный jobid
             job_id = str(time.time()).replace(".", "")
-
-            # Запускаем поток для обработки сортировки
-            sorting_thread = threading.Thread(target=self.sort_numbers_thread, args=(url, concurrency, job_id))
+            sorting_thread = threading.Thread(target=process_sort_request, args=(url, concurrency, job_id))
             sorting_thread.start()
 
-            # Сохраняем данные о задаче сортировки
             with sorting_data_lock:
                 sorting_data[job_id] = {
                     "state": "queued",
@@ -77,7 +116,6 @@ class SortingServerHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(job_id.encode())
 
         elif self.path.startswith("/?get="):
-            # Обработка запроса на получение состояния сортировки
             query_params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             job_id = query_params.get("get", [None])[0]
 
@@ -87,7 +125,6 @@ class SortingServerHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"Invalid parameters")
                 return
 
-            # Получаем данные о состоянии сортировки
             with sorting_data_lock:
                 sort_info = sorting_data.get(job_id)
 
@@ -106,73 +143,8 @@ class SortingServerHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"Page not found")
 
-    def sort_numbers_thread(self, url, concurrency, job_id):
-        # Загружаем данные из URL и сохраняем их в локальный файл
-        file_path = f"{job_id}.data"
-        try:
-            urllib.request.urlretrieve(url, file_path)
-        except Exception as e:
-            with sorting_data_lock:
-                sorting_data[job_id] = {
-                    "state": "error",
-                    "data": []
-                }
-            return
 
-        # Считываем данные из файла и сортируем
-        with open(file_path, "r") as f:
-            numbers = [int(num) for num in f.read().strip().split()]
-
-        # Разбиваем данные на куски для многопоточной сортировки
-        chunk_size = len(numbers) // concurrency
-        chunks = [numbers[i:i + chunk_size] for i in range(0, len(numbers), chunk_size)]
-
-        # Создаем список потоков для сортировки
-        threads = []
-        for chunk in chunks:
-            t = threading.Thread(target=self.sort_chunk_thread, args=(chunk,))
-            threads.append(t)
-            t.start()
-
-        # Ждем, пока все потоки завершат работу
-        for t in threads:
-            t.join()
-
-        # Объединяем отсортированные куски
-        sorted_numbers = reduce(merge, [t.result for t in threads])
-
-        # Сохраняем результат сортировки
-        with sorting_data_lock:
-            sorting_data[job_id] = {
-                "state": "ready",
-                "data": sorted_numbers
-            }
-
-        # Удаляем временный файл
-        os.remove(file_path)
-
-    def sort_chunk_thread(self, numbers):
-        result = merge_sort(numbers)
-        threading.current_thread().result = result
-
-
-# Очередь для хранения задач сортировки
-sorting_queue = queue.Queue()
-
-# Очередь для хранения результатов сортировки
-result_queue = queue.Queue()
-
-
-# Функция worker для сортировки кусков данных
-def worker():
-    while True:
-        chunk, job_id = sorting_queue.get()
-        result = merge_sort(chunk)
-        result_queue.put(result)
-        sorting_queue.task_done()
-
-
-# Запускаем сервер в отдельном потоке
+# Функция для запуска сервера
 def start_server():
     server_address = ("", 8888)
     http_server = http.server.HTTPServer(server_address, SortingServerHandler)
@@ -181,10 +153,10 @@ def start_server():
 
 
 if __name__ == "__main__":
-    # Запускаем сервер и рабочий потоки
     server_thread = threading.Thread(target=start_server)
-    num_worker_threads = 4  # Здесь можно указать количество worker-потоков
+    num_worker_threads = 4
     worker_threads = [threading.Thread(target=worker) for _ in range(num_worker_threads)]
+
     server_thread.start()
     for t in worker_threads:
         t.start()
